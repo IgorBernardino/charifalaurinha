@@ -2,7 +2,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   getFirestore, doc, collection, onSnapshot, runTransaction,
-  writeBatch, setDoc, serverTimestamp
+  writeBatch, setDoc, serverTimestamp, arrayUnion, arrayRemove
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import {
   getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged
@@ -42,6 +42,8 @@ let sorteio = { numero: null, data: "" };
 let numeros = {};                 // { "7": {s, nome, modo, tamanho, valor, obs, t, origem, pedido} }
 let configLoaded = false, configExists = false, numerosLoaded = false, loadError = "";
 let authUser = null, isAdmin = false;
+let contatos = {};                // { pedido: {nome, telefone, numeros[]} } — só o organizador lê
+let unsubContatos = null;
 
 let view = "public", adminTab = "numeros";
 let sel = [], asel = [];
@@ -57,6 +59,26 @@ const firstName = (n) => { const p = String(n || "").trim().split(/\s+/); return
 const fmtDate = (d) => { if (!d) return ""; const p = d.split("-"); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0]}` : d; };
 const sizes = () => String(config.tamanhos || "").split(",").map((x) => x.trim()).filter(Boolean);
 const waNumber = () => { let d = String(config.whatsapp || "").replace(/\D/g, ""); if (!d) return ""; if (d.length <= 11) d = "55" + d; return d; };
+const digits = (s) => String(s || "").replace(/\D/g, "");
+const telOk = (s) => /^[1-9]{2}9?[0-9]{8}$/.test(digits(s));
+function fmtTel(s) {
+  const d = digits(s);
+  if (d.length === 11) return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
+  if (d.length === 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
+  return s || "";
+}
+function maskTel(v) {
+  const d = digits(v).slice(0, 11);
+  if (d.length <= 2) return d.length ? `(${d}` : "";
+  if (d.length <= 6) return `(${d.slice(0, 2)}) ${d.slice(2)}`;
+  if (d.length <= 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
+  return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
+}
+function novoPedido() {
+  const a = new Uint8Array(12); crypto.getRandomValues(a);
+  return Array.from(a, (b) => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
+}
+const contatoDe = (n) => (n && n.pedido && contatos[n.pedido]) || null;
 const tsDate = (t) => (t && typeof t.toDate === "function" ? t.toDate() : null);
 
 function counts() {
@@ -126,6 +148,15 @@ if (!configured) {
       signOut(auth);
     }
     if (!isAdmin && view === "admin") view = "public";
+    // Telefones: só carregam para o organizador
+    if (isAdmin && !unsubContatos) {
+      unsubContatos = onSnapshot(collection(db, "contatos"), (snap) => {
+        const next = {}; snap.forEach((d) => { next[d.id] = d.data(); });
+        contatos = next;
+        if (view === "admin") refreshAdmin();
+      }, (e) => console.error(e));
+    }
+    if (!isAdmin && unsubContatos) { unsubContatos(); unsubContatos = null; contatos = {}; }
     seedConfigIfNeeded();
     render();
   });
@@ -278,7 +309,9 @@ function renderPublic() {
   const clr = $("#clr"), go = $("#go");
   if (clr) clr.onclick = () => { sel = []; renderPublic(); };
   if (go) go.onclick = () => {
-    sheet = { stage: "form", modo: "fralda", nome: "", tamanho: sizes()[0] || "", valor: config.pixMinimo, reservados: [] };
+    let salvo = {};
+    try { salvo = JSON.parse(localStorage.getItem("rifa-contato") || "{}"); } catch { /* sem armazenamento */ }
+    sheet = { stage: "form", modo: "fralda", nome: salvo.nome || "", telefone: salvo.telefone || "", tamanho: sizes()[0] || "", valor: config.pixMinimo, reservados: [] };
     renderPublic(); renderSheet();
   };
   $("#orgLogin").onclick = entrarOrganizador;
@@ -290,7 +323,7 @@ function buildMsg(lista) {
   const t = sheet.modo === "fralda"
     ? `1 pacote de fralda${sheet.tamanho ? ` (tamanho ${sheet.tamanho})` : ""} + 1 mimo por número${q > 1 ? ` — total: ${q} pacotes + ${q} mimos` : ""}`
     : `Pix de ${money(sheet.valor)} por número — total ${money(sheet.valor * q)}`;
-  return `Olá! Reservei ${q > 1 ? "números" : "um número"} na ${config.titulo} 💕\n\nNome: ${sheet.nome.trim() || "(meu nome)"}\nNúmero${q > 1 ? "s" : ""}: ${lista.map(pad).join(", ")}\nForma: ${t}` +
+  return `Olá! Reservei ${q > 1 ? "números" : "um número"} na ${config.titulo} 💕\n\nNome: ${sheet.nome.trim() || "(meu nome)"}\nTelefone: ${sheet.telefone ? fmtTel(sheet.telefone) : "(meu telefone)"}\nNúmero${q > 1 ? "s" : ""}: ${lista.map(pad).join(", ")}\nForma: ${t}` +
     (sheet.modo === "pix" ? "\n\nSegue o comprovante do Pix." : "") + "\n\nObrigado!";
 }
 
@@ -329,6 +362,9 @@ function renderSheet() {
     h += `<h2 id="sht">Seus números: <span class="tnum">${sel.map(pad).join(", ")}</span></h2>
       <p class="sub">Falta pouco! Diga quem é você e como quer contribuir.</p>
       <div class="field"><label for="f-nome">Seu nome</label><input class="inp" id="f-nome" autocomplete="name" maxlength="60" value="${esc(sheet.nome)}" placeholder="Ex.: Maria Souza"></div>
+      <div class="field"><label for="f-tel">Telefone / WhatsApp</label><input class="inp tnum" id="f-tel" type="tel" inputmode="numeric" autocomplete="tel-national" value="${esc(maskTel(sheet.telefone))}" placeholder="(13) 99999-9999">
+        <span class="hint">Só a família vê seu telefone. Ele serve para te encontrar se houver algum problema com a reserva.</span>
+        <span class="err" id="telerr" hidden>Digite o telefone com DDD.</span></div>
       <span class="lbl">Forma de contribuição</span><div class="opts" style="margin-top:6px">
         <button class="opt" data-m="fralda" aria-pressed="${sheet.modo === "fralda"}"><b>Fralda + mimo</b><span>${q} pacote${q > 1 ? "s" : ""} + ${q} mimo${q > 1 ? "s" : ""}</span></button>
         <button class="opt" data-m="pix" aria-pressed="${sheet.modo === "pix"}"><b>Pix</b><span>A partir de ${money(min)} por número</span></button>
@@ -365,6 +401,13 @@ function renderSheet() {
     const e = $("#valerr"); if (e) e.hidden = Number(sheet.valor) >= min;
   };
   $("#f-nome").oninput = (e) => { sheet.nome = e.target.value; refresh(); };
+  const ftel = $("#f-tel");
+  ftel.oninput = (e) => {
+    const m = maskTel(e.target.value); e.target.value = m; sheet.telefone = digits(m);
+    if (telOk(sheet.telefone)) $("#telerr").hidden = true;
+    refresh();
+  };
+  ftel.onblur = () => { $("#telerr").hidden = !sheet.telefone || telOk(sheet.telefone); };
   const ft = $("#f-tam"); if (ft) ft.oninput = ft.onchange = (e) => { sheet.tamanho = e.target.value; refresh(); };
   const fv = $("#f-val"); if (fv) fv.oninput = (e) => { sheet.valor = e.target.value; refresh(); };
   $("#reservar").onclick = reservar;
@@ -374,19 +417,27 @@ async function reservar() {
   if (busy) return;
   const nome = sheet.nome.trim(), min = Number(config.pixMinimo) || 0;
   if (nome.length < 2) { toast("Digite seu nome."); $("#f-nome").focus(); return; }
+  const telefone = digits(sheet.telefone);
+  if (!telOk(telefone)) { $("#telerr").hidden = false; toast("Digite seu telefone com DDD."); $("#f-tel").focus(); return; }
   if (sheet.modo === "pix" && !(Number(sheet.valor) >= min)) { toast(`O valor mínimo é ${money(min)} por número.`); return; }
   if (!sel.length) return;
 
   busy = true;
   const btn = $("#reservar"); btn.disabled = true; btn.textContent = "Reservando…";
   const lista = sel.slice();
-  const pedido = Math.random().toString(36).slice(2, 10);
+  const pedido = novoPedido();
   try {
     await runTransaction(db, async (tx) => {
       const refs = lista.map((n) => doc(db, "numeros", String(n)));
       const snaps = await Promise.all(refs.map((r) => tx.get(r)));
       const ocupados = snaps.filter((s) => s.exists()).map((s) => +s.id);
       if (ocupados.length) { const err = new Error("ocupado"); err.ocupados = ocupados; throw err; }
+      // Contato fica numa coleção separada, que só o organizador pode ler
+      tx.set(doc(db, "contatos", pedido), {
+        nome, telefone, numeros: lista, modo: sheet.modo,
+        valor: sheet.modo === "pix" ? Number(sheet.valor) : null,
+        t: serverTimestamp()
+      });
       refs.forEach((r) => tx.set(r, {
         s: "reservado", nome, modo: sheet.modo,
         tamanho: sheet.modo === "fralda" ? String(sheet.tamanho || "").slice(0, 10) : "",
@@ -394,6 +445,7 @@ async function reservar() {
         t: serverTimestamp(), origem: "site", pedido
       }));
     });
+    try { localStorage.setItem("rifa-contato", JSON.stringify({ nome, telefone })); } catch { /* sem armazenamento */ }
     sheet.stage = "done"; sheet.reservados = lista; sel = [];
     busy = false; renderPublic(); renderSheet();
   } catch (e) {
@@ -494,8 +546,9 @@ function renderEditor() {
     return;
   }
   const first = numeros[asel[0]] || {};
+  const ct = contatoDe(first);
   ed = {
-    s: first.s || "reservado", nome: first.nome || "", modo: first.modo || "fralda",
+    s: first.s || "reservado", nome: first.nome || "", telefone: ct ? ct.telefone : "", modo: first.modo || "fralda",
     tamanho: first.tamanho || "", valor: first.valor != null ? first.valor : config.pixMinimo, obs: first.obs || ""
   };
   const anyTaken = asel.some((i) => numeros[i]);
@@ -505,6 +558,7 @@ function renderEditor() {
       <span class="lbl">Situação</span><div class="seg two" style="margin-top:6px">
         <button data-es="reservado" aria-pressed="${ed.s === "reservado"}">Reservado</button><button data-es="pago" aria-pressed="${ed.s === "pago"}">Confirmado</button></div>
       <div class="field"><label for="e-nome">Nome do participante</label><input class="inp" id="e-nome" maxlength="60" value="${esc(ed.nome)}"></div>
+      <div class="field"><label for="e-tel">Telefone</label><input class="inp tnum" id="e-tel" type="tel" inputmode="numeric" value="${esc(maskTel(ed.telefone))}" placeholder="(13) 99999-9999">${ed.telefone && telOk(ed.telefone) ? `<span class="hint"><a href="https://wa.me/55${digits(ed.telefone)}" target="_blank" rel="noopener">Abrir conversa no WhatsApp</a></span>` : ""}</div>
       <span class="lbl">Forma</span><div class="seg two" style="margin-top:6px"><button data-em="fralda" aria-pressed="${ed.modo === "fralda"}">Fralda + mimo</button><button data-em="pix" aria-pressed="${ed.modo === "pix"}">Pix</button></div>
       ${ed.modo === "fralda"
         ? `<div class="field"><label for="e-tam">Tamanho da fralda</label><input class="inp" id="e-tam" list="tams" maxlength="10" value="${esc(ed.tamanho)}"><datalist id="tams">${sizes().map((z) => `<option value="${esc(z)}">`).join("")}</datalist></div>`
@@ -516,6 +570,7 @@ function renderEditor() {
     $$("[data-es]", box).forEach((b) => { b.onclick = () => { ed.s = b.dataset.es; draw(); }; });
     $$("[data-em]", box).forEach((b) => { b.onclick = () => { ed.modo = b.dataset.em; draw(); }; });
     $("#e-nome").oninput = (e) => { ed.nome = e.target.value; };
+    $("#e-tel").oninput = (e) => { const m = maskTel(e.target.value); e.target.value = m; ed.telefone = digits(m); };
     const et = $("#e-tam"); if (et) et.oninput = (e) => { ed.tamanho = e.target.value; };
     const ev = $("#e-val"); if (ev) ev.oninput = (e) => { ed.valor = e.target.value; };
     $("#e-obs").oninput = (e) => { ed.obs = e.target.value; };
@@ -532,15 +587,24 @@ function renderEditor() {
 
 async function aplicarEdicao() {
   if (!ed.nome.trim()) { toast("Informe o nome do participante."); $("#e-nome").focus(); return; }
+  if (ed.telefone && !telOk(ed.telefone)) { toast("Telefone incompleto. Use DDD + número, ou deixe em branco."); $("#e-tel").focus(); return; }
   const b = writeBatch(db);
+  // Reaproveita o pedido existente dos números selecionados, ou cria um novo
+  const pedido = (asel.map((i) => numeros[i] && numeros[i].pedido).find(Boolean)) || novoPedido();
+  b.set(doc(db, "contatos", pedido), {
+    nome: ed.nome.trim(), telefone: digits(ed.telefone), numeros: arrayUnion(...asel),
+    modo: ed.modo, valor: ed.modo === "pix" ? Number(ed.valor) || 0 : null, t: serverTimestamp()
+  }, { merge: true });
   asel.forEach((i) => {
     const old = numeros[i] || {};
+    // Número que estava em outro pedido sai da lista daquele contato
+    if (old.pedido && old.pedido !== pedido && contatos[old.pedido]) b.update(doc(db, "contatos", old.pedido), { numeros: arrayRemove(i) });
     b.set(doc(db, "numeros", String(i)), {
       s: ed.s, nome: ed.nome.trim(), modo: ed.modo,
       tamanho: ed.modo === "fralda" ? String(ed.tamanho || "").trim() : "",
       valor: ed.modo === "pix" ? Number(ed.valor) || 0 : null,
       obs: String(ed.obs || "").trim(), t: serverTimestamp(),
-      origem: old.origem || "admin", pedido: old.pedido || ""
+      origem: old.origem || "admin", pedido
     });
   });
   try {
@@ -552,7 +616,11 @@ async function aplicarEdicao() {
 
 async function liberar(lista) {
   const b = writeBatch(db);
-  lista.forEach((i) => b.delete(doc(db, "numeros", String(i))));
+  lista.forEach((i) => {
+    const p = numeros[i] && numeros[i].pedido;
+    if (p && contatos[p]) b.update(doc(db, "contatos", p), { numeros: arrayRemove(i) });
+    b.delete(doc(db, "numeros", String(i)));
+  });
   try {
     await b.commit();
     toast(`${lista.length} número${lista.length > 1 ? "s liberados" : " liberado"}.`);
@@ -573,9 +641,13 @@ function grupos() {
   const g = {};
   for (let i = 1; i <= total(); i++) {
     const n = numeros[i]; if (!n) continue;
-    const k = String(n.nome || "(sem nome)").trim().toLowerCase();
-    if (!g[k]) g[k] = { nome: n.nome || "(sem nome)", nums: [], pag: 0, res: 0, fr: 0, pix: 0, tams: new Set(), site: false, ultimo: 0 };
+    const ct = contatoDe(n), tel = ct ? digits(ct.telefone) : "";
+    // Agrupa pelo telefone quando existe (mesma pessoa com nomes escritos diferente)
+    const k = tel ? "t:" + tel : "n:" + String(n.nome || "(sem nome)").trim().toLowerCase();
+    if (!g[k]) g[k] = { nome: n.nome || "(sem nome)", nomes: new Set(), telefone: tel, pedidos: new Set(), nums: [], pag: 0, res: 0, fr: 0, pix: 0, tams: new Set(), site: false, ultimo: 0 };
     const x = g[k];
+    x.nomes.add(String(n.nome || "").trim());
+    if (n.pedido) x.pedidos.add(n.pedido);
     x.nums.push(i);
     if (n.s === "pago") x.pag++; else x.res++;
     if (n.modo === "pix") x.pix += Number(n.valor) || 0; else { x.fr++; if (n.tamanho) x.tams.add(n.tamanho); }
@@ -589,20 +661,25 @@ function grupos() {
 function panelPessoas() {
   const g = grupos();
   if (!g.length) { $("#panel").innerHTML = '<div class="card empty">Ainda não há participantes. As reservas feitas pelo site aparecem aqui na hora.</div>'; return; }
-  let h = '<div class="tablewrap"><table><thead><tr><th>Participante</th><th>Números</th><th>Contribuição</th><th>Situação</th><th>Ações</th></tr></thead><tbody>';
+  // Nomes iguais com telefones diferentes podem ser pessoas diferentes ou erro de digitação
+  const porNome = {};
+  g.forEach((x) => { const k = x.nome.trim().toLowerCase(); porNome[k] = (porNome[k] || 0) + 1; });
+  let h = '<div class="tablewrap"><table><thead><tr><th>Participante</th><th>Telefone</th><th>Números</th><th>Contribuição</th><th>Situação</th><th>Ações</th></tr></thead><tbody>';
   g.forEach((x, idx) => {
     const contrib = [];
     if (x.fr) contrib.push(`${x.fr} fralda${x.fr > 1 ? "s" : ""} + mimo${x.fr > 1 ? "s" : ""}${x.tams.size ? ` (${[...x.tams].join(", ")})` : ""}`);
     if (x.pix) contrib.push("Pix " + money(x.pix));
     const quando = x.ultimo ? new Date(x.ultimo).toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "";
     h += `<tr class="click" data-g="${idx}" tabindex="0">
-      <td><b>${esc(x.nome)}</b>${quando ? `<br><span style="font-size:12px;color:var(--muted)">${quando}</span>` : ""}</td>
+      <td><b>${esc(x.nome)}</b>${x.nomes.size > 1 ? `<br><span style="font-size:12px;color:var(--muted)">também como: ${esc([...x.nomes].filter((v) => v && v !== x.nome).join(", "))}</span>` : ""}${quando ? `<br><span style="font-size:12px;color:var(--muted)">${quando}</span>` : ""}
+        ${x.pedidos.size > 1 ? `<br><span class="pill res">${x.pedidos.size} pedidos</span>` : ""}${porNome[x.nome.trim().toLowerCase()] > 1 ? ' <span class="pill res">nome repetido</span>' : ""}</td>
+      <td class="tnum">${x.telefone ? `<a href="https://wa.me/55${x.telefone}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(fmtTel(x.telefone))}</a>` : '<span style="color:var(--muted)">—</span>'}</td>
       <td class="tnum">${x.nums.map(pad).join(", ")}</td>
       <td>${esc(contrib.join(" · ") || "-")}</td>
       <td>${x.pag ? `<span class="pill pag">${x.pag} confirmado${x.pag > 1 ? "s" : ""}</span> ` : ""}${x.res ? `<span class="pill res">${x.res} reservado${x.res > 1 ? "s" : ""}</span> ` : ""}${x.site ? '<span class="pill site">pelo site</span>' : ""}</td>
       <td><div class="acts-sm">${x.res ? `<button class="btn btn-soft" data-conf="${idx}">Confirmar</button>` : ""}<button class="btn btn-danger" data-lib="${idx}">Liberar</button></div></td></tr>`;
   });
-  h += '</tbody></table></div><p class="note">Toque em um participante para editar os números dele. "Confirmar" marca como pago tudo o que está reservado para essa pessoa.</p>';
+  h += '</tbody></table></div><p class="note">Toque em um participante para editar os números dele. "Confirmar" marca como pago tudo o que está reservado para essa pessoa. Pessoas com o mesmo telefone aparecem juntas; os avisos "nome repetido" e "pedidos" ajudam a achar duplicidades.</p>';
   $("#panel").innerHTML = h;
   $$("tr[data-g]").forEach((r) => {
     const open = () => { asel = g[+r.dataset.g].nums.slice(); adminTab = "numeros"; admFilter = "todos"; admQuery = ""; renderAdmin(); };
@@ -716,10 +793,11 @@ async function salvarGanhador(n) {
 
 /* ---------- Exportar CSV ---------- */
 function exportCsv() {
-  const rows = [["Número", "Situação", "Nome", "Forma", "Tamanho fralda", "Valor Pix", "Observação", "Origem", "Atualizado em"]];
+  const rows = [["Número", "Situação", "Nome", "Telefone", "Forma", "Tamanho fralda", "Valor Pix", "Observação", "Origem", "Atualizado em"]];
   for (let i = 1; i <= total(); i++) {
     const n = numeros[i] || {}, d = tsDate(n.t);
-    rows.push([pad(i), n.s ? (n.s === "pago" ? "Confirmado" : "Reservado") : "Disponível", n.nome || "",
+    const ct = contatoDe(n);
+    rows.push([pad(i), n.s ? (n.s === "pago" ? "Confirmado" : "Reservado") : "Disponível", n.nome || "", ct && ct.telefone ? fmtTel(ct.telefone) : "",
       n.s ? (n.modo === "pix" ? "Pix" : "Fralda + mimo") : "", n.tamanho || "",
       n.modo === "pix" ? String(n.valor || 0).replace(".", ",") : "", n.obs || "",
       n.origem === "site" ? "Site" : n.s ? "Painel" : "", d ? d.toLocaleString("pt-BR") : ""]);
