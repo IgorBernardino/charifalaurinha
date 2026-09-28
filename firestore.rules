@@ -1,0 +1,55 @@
+rules_version = '2';
+
+// Regras do Firestore da Chá Rifa da Laurinha.
+// Troque SEU_EMAIL@gmail.com pelo e-mail da conta Google do organizador
+// (o mesmo de firebase-config.js) antes de publicar.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.email == 'SEU_EMAIL@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
+    function cfg() {
+      return get(/databases/$(database)/documents/rifa/config).data.config;
+    }
+
+    // Reserva feita pelo participante no site: só cria número livre,
+    // sempre como "reservado", com dados válidos e valor Pix acima do mínimo.
+    function reservaValida(n) {
+      let d = request.resource.data;
+      let c = cfg();
+      return c.aceitandoPedidos == true
+        && n.matches('^[0-9]{1,4}$')
+        && int(n) >= 1 && int(n) <= c.totalNumeros
+        && d.keys().hasOnly(['s', 'nome', 'modo', 'tamanho', 'valor', 't', 'origem', 'pedido'])
+        && d.keys().hasAll(['s', 'nome', 'modo', 'tamanho', 'valor', 't', 'origem', 'pedido'])
+        && d.s == 'reservado'
+        && d.origem == 'site'
+        && d.nome is string && d.nome.size() >= 2 && d.nome.size() <= 60
+        && d.tamanho is string && d.tamanho.size() <= 10
+        && d.pedido is string && d.pedido.size() <= 20
+        && d.t == request.time
+        && (
+          (d.modo == 'fralda' && d.valor == null)
+          || (d.modo == 'pix' && d.valor is number && d.valor >= c.pixMinimo && d.valor <= 10000)
+        );
+    }
+
+    // Configurações e resultado do sorteio: todos leem, só o organizador altera.
+    match /rifa/config {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Números: todos leem. Participante só cria reserva em número livre.
+    // Confirmar, editar e liberar é só com o organizador.
+    match /numeros/{n} {
+      allow read: if true;
+      allow create: if isAdmin() || reservaValida(n);
+      allow update, delete: if isAdmin();
+    }
+  }
+}
